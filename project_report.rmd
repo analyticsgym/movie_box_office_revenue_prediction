@@ -1,0 +1,567 @@
+---
+title: "Movie Box Office Revenue Prediction"
+author: "Brian M"
+date: "6/14/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(dev = 'pdf')
+```
+
+## Summary
+<!-- section that describes the dataset and variables, and summarizes the goal of the project and key steps that were performed. -->
+In 2019, movie global box office revenue hit a record $42.5 billion (source: hollywoodreporter). We're hired by a movie production startup who wants to make it big producing movies. Using historical movie data, we're tasked with building a model that can predict international movie box office revenue using movie attributes. Stakeholders also want to be able to see what variables tend to be most predictive of a movie blockbuster (e.g. model interpretation will need to be considered).
+
+We're given a Kaggle training dataset which has 23 initial features and 3000 observations. The Kaggle dataset is sourced from The Movie Database (TMDB). The dataset is curated by TMDB community members who input movie metadata. A glimpse of the starting features and data structure is shown below:
+
+```{r load_data, include = FALSE}
+### disable scientific notation
+options(scipen=999) 
+
+# load and/or installs required packages
+required_packages <- c('tidyverse','caret','lubridate','ranger','Hmisc',
+                       'scales', 'corrplot','Metrics')
+for(p in required_packages){
+      if(!require(p,character.only = TRUE)) install.packages(p, repos = "http://cran.us.r-project.org")
+      library(p,character.only = TRUE)
+}
+
+### get Kaggle dataset from github repo
+df_raw <- read_csv("tmdb-box-office-data.csv")
+
+### split the data into a train and test set
+set.seed(57)
+trainIndex <- createDataPartition(df_raw$revenue, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+
+train_df <- df_raw[trainIndex,] %>% mutate(label="train")
+test_df  <- df_raw[-trainIndex,] %>% mutate(label="test")
+
+all_data <- rbind(train_df, test_df)
+```
+
+```{r show_data, echo = FALSE}
+glimpse(all_data)
+```
+We'll use 80% of the data for training and 20% of the training data as a final test dataset. Given the dataset is only 3000 observations, we'll use cross validation on the training data to optimize model performance. By partioning only 20% of the available for testing we hope to leave ample data for training our models. The test dataset will only be used for final prediction assessment. Our project dataset has many features in JSON format and NA values are present. We'll treat the JSON features as characters strings and mine the text using regular experssions / text analysis techniques. Feature imputation techniques will be used to fill in the NA values. Additionally, the dataset includes a mix of numeric, time series, and text feeatures whcih we'll look to extract useful signal from.
+
+Our target variable for prediction is revenue. In order to not over pentalize blockbluster movies we predict/measure performance on the log of revenue and use RMSE (root mean square error) for performance assessment.
+
+###### Phases of this project:
+1) Read in the project datasets
+2) Data cleaning & feature engineering
+4) Leverage Caret package to test various models and optimize tuning parameters
+5) Select top performing model
+6) Output final RMSE for the validation dataset
+
+## Analysis & Method
+<!-- section that explains the process and techniques used, including data cleaning, data exploration and visualization, insights gained, and your modeling approach -->
+
+#### Feature cleaning and feature engineering steps
+Below we highlight which features have NA  values. When movie runtime is missing, we replace run time with the median runtime.
+Mode imputation is used to replace missing language and status variables. 
+Additional text based features which are NA are replaced with "Missing" text. Movie year is corrupted for several movies and does not return NA. We create a custom function to clean movie year. 
+
+```{r feature_eng_1, echo=FALSE}
+### function to view all features that have NAs
+missing_data_fun <- function(df) {
+      df_result <- as.data.frame(sapply(df, function(x) sum(is.na(x))))
+      df_result <- rownames_to_column(df_result, var = "feature")
+      colnames(df_result)[2] <- c("NA_Count")
+      df_result %>% dplyr::filter(NA_Count>0) %>% arrange(desc(NA_Count))
+}
+
+missing_data_fun(all_data)
+
+### replace NA runtime with median runtime
+all_data <- all_data %>% 
+      mutate(runtime = replace_na(runtime, median(runtime, na.rm=TRUE)))
+
+### convert release date to date type
+### replace NA release data with median release date
+year_clean <- function(x, year=1917){
+      m <- year(x) %% 100
+      year(x) <- ifelse(m > year %% 100, 1900+m, 2000+m)
+      x
+}
+all_data <- all_data %>% 
+      mutate(release_date_clean = year_clean(as.Date(release_date, format = "%m/%d/%y")),
+             release_date_clean = replace_na(release_date_clean, median(release_date_clean, na.rm=TRUE)))
+
+### mode imputation: spoken_languages, status
+Mode <- function(x) {
+      ux <- unique(x)
+      ux[which.max(tabulate(match(x, ux)))]
+}
+all_data <- all_data %>% 
+      mutate(spoken_languages = replace_na(spoken_languages, Mode(spoken_languages)),
+             status = replace_na(status, Mode(status)))
+
+### for the remaining features still with NA values replace with Missing:
+# belongs_to_collection, homepage, tagline, Keywords, production_companies, 
+# production_countries, genres, overview, crew, poster_path
+all_data <- all_data %>% 
+      mutate_at(missing_data_fun(all_data)$feature, ~replace_na(., "Missing"))
+```
+
+After the first phase of feature cleaning, we move to deriving new features off the base set of features with the goal of extracting useful signals for model prediction.
+
+```{r feature_eng_2}
+### derive features
+all_data <- all_data %>% 
+  mutate(pre_process_budget = budget,
+  pre_process_budget_available = ifelse(pre_process_budget>0,1,0),
+  release_year = year(release_date_clean),
+  before_2000_flag = ifelse(year(release_date_clean)<2000,1,0),
+  before_1980_flag = ifelse(year(release_date_clean)<1980,1,0),
+  release_year_bin = cut2(year(release_date_clean), g=10),
+  release_month = month(release_date_clean),
+  release_month_day = day(release_date_clean),
+  release_week_number = week(release_date_clean),
+  release_day_of_week = wday(release_date_clean, label = TRUE),
+  release_year_quarter_str = paste0("Quarter","::",
+  quarter(release_date_clean, with_year = FALSE, fiscal_start = 1)),
+  title_length = str_length(title),
+  belongs_to_collection_flag = ifelse(str_count(belongs_to_collection, "name")>0,1,0),
+  tagline_available = ifelse(tagline=="Missing", 0, 1),
+  homepage_available = ifelse(homepage=="Missing", 0, 1),
+  homepage_disney_flag = ifelse(str_count(homepage, "disney")>0,1,0),
+  homepage_sony_flag = ifelse(str_count(homepage, "sony")>0,1,0),
+  homepage_warnerbros_flag = ifelse(str_count(homepage, "warnerbros")>0,1,0),
+  homepage_focusfeatures_flag = ifelse(str_count(homepage, "focusfeatures")>0,1,0),
+  homepage_fox_flag = ifelse(str_count(homepage, "foxmovies")>0 |
+                                    str_count(homepage, "foxsearchlight")>0,1,0),
+  homepage_magpictures_flag = ifelse(str_count(homepage, "magpictures")>0,1,0),
+  homepage_mgm_flag = ifelse(str_count(homepage, ".mgm.")>0,1,0),
+  homepage_miramax_flag = ifelse(str_count(homepage, ".miramax.")>0,1,0),
+  homepage_facebook_flag = ifelse(str_count(homepage, ".facebook.")>0,1,0),
+  genres_count = str_count(genres, "id"),
+  production_company_count = str_count(production_companies, "name"),
+  production_country_count = str_count(production_countries, "name"),
+  spoken_languages_count = str_count(spoken_languages, "name"),
+  cast = ifelse(cast=="[]","Missing", cast),
+  cast = ifelse(cast=="#N/A","Missing", cast),
+  cast_count = str_count(cast, "cast_id"),
+  cast_gender_0_count = str_count(cast, "'gender': 0,"),
+  cast_gender_1_count = str_count(cast, "'gender': 1,"),
+  cast_gender_2_count = str_count(cast, "'gender': 2,"),
+  crew = ifelse(crew=="#N/A","Missing", crew),
+  crew_count = str_count(crew, "credit_id"),
+  director_count = str_count(crew, "job': 'Director', 'name':"),
+  producer_count = str_count(crew, "job': 'Producer', 'name':"),
+  exec_producer_count = str_count(crew, "'job': 'Executive Producer', 'name':"),
+  independent_film_flag = ifelse(str_count(Keywords, "independent film")>0,1,0)
+)
+```
+
+In the third phase of feature engineering, we look to clean up derived features and prepare for iterative exploratory analysis and modeling. When cast or crew count is zero, replace with median. A KNN model (trained on the training data only) is used to predict movie budget when budget is less than 1k. ~30% of observations in training set have budget less than 1k. 
+
+JSON string parsing is also used to extract various features about the movie production company and crew. For sparse values we set them to other and add flags if a movie was developed by one or more popular production companies.
+
+```{r feature_eng_3, echo=FALSE}
+### if zero, replace cast & crew count with median
+all_data <- all_data %>% 
+      mutate(cast_count = ifelse(cast_count==0,
+                                 median(all_data$cast_count), cast_count),
+             crew_count = ifelse(crew_count==0, 
+                                 median(all_data$crew_count), crew_count))
+
+### build knn model on training data
+### use to fill in train and test observations with movie budgets 1000 or less
+ctrl <- trainControl(method="repeatedcv",repeats = 3)
+knn_budget <- train(budget ~ release_year + cast_count + crew_count + 
+                          director_count + exec_producer_count + 
+                          production_company_count + production_country_count +
+                          independent_film_flag, 
+                    data = all_data %>% filter(label=="train" & budget>1000), 
+                    method = "knn", 
+                    trControl = ctrl, 
+                    preProcess = c("center","scale"), 
+                    tuneLength = 10)
+
+### use knn model to predict budget for train and test 
+### where observations budgets 1000 or less
+all_data$budget[all_data$budget<=1000] <- predict(knn_budget, newdata = all_data %>% filter(budget<=1000))
+
+### add log budget feature
+all_data <- all_data %>% 
+      mutate(log_budget = log(budget))
+
+### get first descriptors listed for what might be important features
+all_data <- all_data %>%
+    group_by(id) %>%
+    mutate(first_genre_listed = replace_na(strsplit(strsplit(genres, "name': '")[[1]][2],"'")[[1]][1],"Missing"),
+           first_director_name = replace_na(strsplit(strsplit(crew, "job': 'Director', 'name':")[[1]][2],"'")[[1]][2],"Missing"),
+           first_production_company = replace_na(strsplit(strsplit(production_companies, "'name': '")[[1]][2],"'")[[1]][1],"Missing"),
+           first_production_country = replace_na(strsplit(strsplit(production_countries, "'name': '")[[1]][2],"'")[[1]][1],"Missing")) %>%
+    ungroup()
+
+### use to extract names based on a specified pattern
+json_name_parser <- function(pattern, input_string) {
+      result <- str_extract_all(input_string, pattern)[[1]]
+      result <- str_replace_all(result, pattern, "\\2")
+      result <- paste(sort(result), sep="",collapse = ", ")
+      result <- if_else(result=="","Missing",result)
+      return(result)
+}
+
+### use to extract prod company based on a specified pattern
+prod_company_parser <- function(pattern, input_string) {
+      result <- sort(str_match_all(input_string, prod_companies_pattern)[[1]][,3])
+      result <- paste(result, sep="",collapse = ", ")
+      result <- if_else(result=="","Missing",result)
+      return(result)
+}
+
+### regrex patterns
+### for some companies entire name is not extracted this could be a future area for improvement
+director_pattern <- "('Director', 'name': ')([a-zA-Z]*\\s*[a-zA-Z]*)(')"
+collection_pattern <- "(, 'name': ')([a-zA-Z.]*\\s*[a-zA-Z.]*\\s*[a-zA-Z.]*\\s*[a-zA-Z.]*\\s*[a-zA-Z.]*)(')"
+prod_companies_pattern <- "(\\{'name': ')([a-zA-Z.]*\\s*[a-zA-Z.]*\\s*[a-zA-Z.]*\\s*[a-zA-Z.]*)"
+genres_pattern <- "('name': ')([a-zA-Z]*\\s*[a-zA-Z]*)(')"
+
+### extract json info using parse pattern
+all_data <- all_data %>%
+      group_by(id) %>%
+      mutate(directors_chr = json_name_parser(director_pattern, crew),
+             collection_chr = json_name_parser(collection_pattern, belongs_to_collection),
+             genres_chr = json_name_parser(genres_pattern, genres),
+             production_company_chr = prod_company_parser(prod_companies_pattern, production_companies)) %>%
+      ungroup()
+```
+
+```{r feature_eng_5, echo=FALSE}
+### generate set of the 20 most popular first prod companies
+top_20_most_popular_first_listed_prod_companies <- all_data %>% 
+      filter(label=="train") %>%
+      count(first_production_company, sort = TRUE) %>%
+      filter(first_production_company!="Missing") %>%
+      filter(row_number()<21) %>%
+      pull(first_production_company)
+
+### 
+popular_first_listed_prod_company <- function(input_str) {
+      result <- sum(top_20_most_popular_first_listed_prod_companies
+                    %in% unlist(strsplit(input_str, split=", ")))
+      return(result)
+}
+
+all_data <- all_data %>%
+      group_by(id) %>%
+      mutate(number_of_popular_first_listed_prod_cos = 
+                   popular_first_listed_prod_company(production_company_chr)) %>%
+      ungroup()
+
+### reduce levels for first production company
+### get the top 200
+top_200_most_popular_first_listed_prod_companies <- all_data %>% 
+      filter(label=="train") %>%
+      count(first_production_company, sort = TRUE) %>%
+      filter(first_production_company!="Missing") %>%
+      filter(row_number()<201) %>%
+      pull(first_production_company)
+
+all_data <- all_data %>%
+      group_by(id) %>%
+      mutate(first_production_company = ifelse(
+            first_production_company %in% top_200_most_popular_first_listed_prod_companies,
+            first_production_company, "Other")) %>%
+      ungroup()
+```
+
+#### Data Exploration & Trends
+Next, we use data visualization to surface context and insights about the problem space.
+
+```{r visualizations, echo=FALSE}
+### Top grossing movies in train dataset
+all_data %>%
+      filter(label=="train") %>%
+      arrange(desc(revenue)) %>%
+      head(10) %>%
+      ggplot(aes(y=reorder(title, revenue), x=revenue/1000000000, fill=revenue/1000000000)) + 
+      geom_col() +
+      labs(title="Top 10 grossing movies in training dataset",
+           y="",
+           x="Revenue (Billions)") +
+      theme(legend.position = "none")
+
+### Snapshot of top first production companies by movie count
+all_data %>%
+      filter(label=="train" & first_production_company!="Other") %>%
+      group_by(first_production_company) %>%
+      summarise(movie_count = n_distinct(imdb_id),
+                median_revenue_millions = median(revenue)/1000000) %>%
+      top_n(15, movie_count) %>%
+      ggplot(aes(x=reorder(first_production_company, movie_count),
+                 y=median_revenue_millions,fill=median_revenue_millions)) +
+      geom_col() +
+      geom_text(aes(label=paste0("n=",movie_count)), vjust=-0.5, size=3) +
+      theme(legend.position = "none",
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            plot.margin = margin(1, 1, 1, 2, "cm")) +
+      labs(title="Top 15: first listed production companies by median movie revenue",
+           x="First Listed Production Company",
+           y="Median Revenue (millions)") +
+      scale_y_continuous(breaks=seq(0,200,20), expand = expansion(mult = c(0.05, .2)))
+
+### Seasonal trend of when top movies are released?
+all_data %>%
+      filter(label=="train") %>%
+      group_by(release_month) %>%
+      summarise(movie_count = n_distinct(imdb_id),
+        median_revenue_millions = median(revenue)/1000000) %>%
+      ggplot(aes(x=release_month, y=median_revenue_millions)) +
+      geom_col(fill="dodgerblue") +
+      geom_text(aes(label=paste0("n=",movie_count)), vjust=-0.5, size=3) +
+      scale_x_continuous(breaks=1:12) +
+      labs(title="Movies released in June, July, and December 
+tend to have higher revenues. Early summer and holidays are historically 
+when studios look to attract movie goers with films that have tested well.") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, .2)))
+
+### Budget zero volume
+all_data %>%
+      filter(label=="train") %>%
+      group_by(budget_1k_or_less_flag = pre_process_budget<=1000) %>%
+      summarise(movie_count = n()) %>%
+      ungroup() %>%
+      mutate(percent_total = movie_count/sum(movie_count)) %>%
+      ggplot(aes(y=movie_count, x=budget_1k_or_less_flag, fill=budget_1k_or_less_flag)) +
+      geom_col() +
+      geom_text(aes(label=percent(percent_total,1)), vjust=-0.5) +
+      labs(title="Movie budget less than or equal to 1k in training set.
+KNN model used to fill budget value for 28% of training observations.",
+           y="Movie Count",
+           x="Budget <= 1000?") +
+      theme(legend.position = "none") +
+      scale_fill_manual(values=c("dodgerblue","grey40")) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, .2)))
+
+### Eda by homepage flag
+homepage_df <- all_data %>%
+      filter(label=="train") %>%
+      select(imdb_id, revenue, contains("homepage_")) %>%
+      gather(key = "homepage_var", value="value", -imdb_id, -revenue) %>%
+      group_by(homepage_var, value) %>%
+      summarise(movie_count = n_distinct(imdb_id),
+                movie_row_count = n(),
+                median_revenue_millions = median(revenue)/1000000) %>%
+      ungroup() %>%
+      filter(value==1 | homepage_var=="homepage_available") %>%
+      mutate(baseline = ifelse(homepage_var=="homepage_available","Overall", "Homepage Feature Flags"),
+             homepage_var = ifelse(homepage_var=="homepage_available" & value==0,
+                                   "homepage_NOT_available", homepage_var))
+
+homepage_df %>%
+      ggplot(aes(x=reorder(homepage_var, median_revenue_millions),
+            y=median_revenue_millions,fill=baseline)) +
+      geom_col() +
+      geom_text(aes(y=0, label=paste0("n=",movie_count)), vjust=-0.5, size=2.5) +
+      facet_grid(.~reorder(baseline, median_revenue_millions), 
+                 space = "free_x", scales = "free_x") +
+      theme(legend.position = "none",
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            plot.margin = margin(1, 1, 1, 2, "cm")) +
+      scale_y_continuous(breaks=seq(0,400,by=50)) +
+      labs(title="Overall: movies that have a homepage URL 
+tend to have higher box office revenue.
+Homepage Feature Flags: well known studios look to more 
+consistently release high revenue movies.",
+           x="",
+           y="Median Revenue (millions)")
+```
+
+#### Modeling approach
+Next, we subset down the feature set to variables we want to prioritize as model inputs. Including all initial and derived character variables will drastically increase the feature space and increase the chance for overfitting. We'll use the Caret package to power our modeling phase. After converting character variables tofactors, Caret by default creates dummy variables for each of the factor variables.
+
+We'll test tree models (rpart, rpart2, treebag, ranger, xgb) to see which performs best using cross validation RMSE.
+Tree models are selected due to interpretability strengths. We'llbe able to leverage feature importance charts to see which variables are most useful  to the final prediction model. Five fold cross validation is used to assess model RMSE and do parameter tuning.Compared to partioning off an additional validation dataset, 5 k CV allows us to use more data for training and helps generate a conversative error estimate.
+
+Features used for the final model:
+```{r modeling_1a, echo=FALSE}
+# remove features that aren't target variables or predictors we want to include
+# convert character vars to factors
+# use log of budget and revenue (which then allows us to use 
+# RMSE for optimization)
+all_data_features_to_include <- all_data %>% 
+      mutate(log_revenue = log(revenue)) %>%
+      select(-id, -belongs_to_collection, -budget, -genres, 
+             -homepage, -imdb_id, -original_title, 
+             -popularity, -poster_path, -production_companies,
+             -release_date, -production_countries, -spoken_languages,
+             -tagline, -title, -Keywords, -cast, -crew,
+             -overview, -revenue, - release_date_clean, -first_director_name,
+             -directors_chr, -collection_chr, -production_company_chr,
+             -pre_process_budget) %>%
+      mutate_if(is.character,as.factor)
+
+# training data
+training <- all_data_features_to_include %>% 
+      filter(label=="train") %>%
+      select(-label)
+
+names(training)
+```
+
+```{r modeling_1b, include=FALSE}
+### cross validation params
+caret_train_control <- trainControl(method = "cv", number = 5)
+
+set.seed(23)
+rpart_model <- train(
+            log_revenue ~., 
+            data = training, 
+            method = "rpart",
+            metric='RMSE',
+            trControl = caret_train_control,
+            tuneGrid = data.frame(cp=c(0.0001, .0005, .001, 
+                                       0.005, 0.01, 0.025, 0.05, 0.1))
+)
+
+set.seed(23)
+rpart2_model <- train(
+            log_revenue ~., 
+            data = training, 
+            method = "rpart2",
+            metric='RMSE',
+            trControl = caret_train_control,
+            tuneGrid = data.frame(maxdepth=seq(4, 16, by=2))
+)
+
+set.seed(23)
+treebag_model <- train(
+      log_revenue ~., 
+      data = training, 
+      method = "treebag",
+      metric='RMSE',
+      trControl = caret_train_control)
+
+rf_grid <- expand.grid(mtry=c(10,20,30),
+                       splitrule=c("variance"),
+                       min.node.size=c(25, 75, 125))
+
+set.seed(23)
+ranger_model <- train(
+            log_revenue ~.,
+            data = training,
+            method = "ranger",
+            metric='RMSE',
+            importance = "impurity",
+            trControl = caret_train_control,
+            tuneGrid = rf_grid)
+
+xgb_grid <- expand.grid(nrounds=100,
+                        max_depth=c(2, 4, 6),
+                        eta=c(0.2),
+                        gamma=c(0,0.1,.5),
+                        colsample_bytree=0.75,
+                        min_child_weight=0.75,
+                        subsample=0.8)
+
+set.seed(23)
+xgb_model <- train(log_revenue ~.,
+                      data = training,
+                      method = "xgbTree",
+                      metric='RMSE',
+                      trControl = caret_train_control,
+                      tuneGrid=xgb_grid)
+xgb_model
+```
+Comparing model performance is done by setting a seed before each model run, we can compare model performance downstream using the same folds (in other words, a fair comparison between models trained on the same data folds). We'll use Caret resamples() to compare model performance using the cross validation resampling results. We select xgb as the final model based on median resample RMSE.
+
+```{r modeling_2, echo=FALSE}
+# Compare model performances using resample()
+models_compare <- resamples(list(rpart1=rpart_model, 
+                                 rpart2=rpart2_model,
+                                 treebag=treebag_model,
+                                 rf=ranger_model,
+                                 xgb=xgb_model))
+
+# Summary of the models performances
+rmse_cv_results <- data.frame(summary(models_compare)$statistics$RMSE) %>%
+      rownames_to_column(var="model") %>%
+      rename(Min = Min.,
+             Q1 = X1st.Qu.,
+             Q3 = X3rd.Qu.,
+             Max = Max.)
+
+### boxplot on target metrics by model
+rmse_cv_results %>%
+      ggplot(aes(y=model, color=model)) +
+      geom_boxplot(aes(xmin=Min,xlower=Q1,xmiddle=Median, 
+                       xupper=Q3, xmax=Max), stat = "identity") +
+      theme(legend.position = "none") +
+      labs(subtitle = "Comparing model RMSE using Caret resample",
+           x="Resample results RMSE",
+           y="Model")
+```
+
+#### Feature Importance
+Using the final xgb model, we can highlight the most important features.
+
+```{r feature_importance, echo=FALSE}
+### Show var importance from top model
+varImp(xgb_model)$importance %>% 
+      as.data.frame() %>%
+      rownames_to_column(var = "features") %>%
+      top_n(20,Overall) %>%
+      rename(importance_score = Overall) %>%
+      ggplot(aes(x=reorder(features, importance_score), y=importance_score, fill=importance_score)) +
+      geom_col() +
+      coord_flip() +
+      theme(legend.position = "none") +
+      labs(subtitle = "Xgb: Feature Importance Ranking",
+           x="Feature",
+           y="Feature Importance Score")
+
+```
+
+# Results
+<!-- section that presents the modeling results and discusses the model performance -->
+#### Prediction Results
+Prediction performance on the holdout test dataset:
+```{r test_set_prediction, echo=FALSE}
+test <- all_data_features_to_include %>% 
+            filter(label=="test") %>%
+            select(-label)
+
+### avg baseline
+avg_pred <- caret::RMSE(pred=predict(ranger_model, newdata=test),
+            obs= mean(test$log_revenue))
+
+### final performance check on test data
+final_pred <- caret::RMSE(pred=predict(ranger_model, newdata=test),
+            obs= test$log_revenue)
+
+final_model_vs_avg <- percent((final_pred -avg_pred)/avg_pred, 1)
+```
+Test set RMSE: `r final_pred`
+
+# Conclusion
+<!-- section that gives a brief summary of the report, its limitations and future work -->
+#### Takeaways
+On average, predicted movie revenue is `r round(final_pred,2)` times larger than the actual revenue or 1/`r round(final_pred,2)` times less the actual movie revenue.
+Compared to a baseline model which predicts the test set average, our final model RMSE is `r final_model_vs_avg` less than a naive baseline.
+
+We can see movie budget is the most important variable for predicting movie box office revenue. It'd be wise for startup movie execs to consider budget size as key factor to competing with established studios. 
+
+Movie startup execs might also consider partnering with well established studios and recruiting multiple directors / producers / exec products as these factors look to be predictive.
+
+Size of cast and crew are also predictive variables to keep top of mind for movie execs. The more people contributing to the movie might help increase the overall quality.
+
+#### Limitations
+Only 3000 movies were considered for this project. Revenue was not adjusted for inflation. The community sourced dataset has impefections and missing data. International movie box office revenue can vary by online source. Human curated datasets can be used for initial model creation and analysis. However, a machine generated dataset might be more reliable for future work on  this topic.
+
+#### Future work areas
+* Using additional data sources to further clean input data (i.e. revenue data for some movies doesn't match other online sources).
+* Use TMDB API to generate larger sample set of movies.
+* Explore more robust / complex models.
+* Incorporate more data about the movie trailer and marketing content.
+* Include features about the historicla awards the movie team has won.
+* Consider adjusting revenue for inflation.
+* Add more compute resources and utlize 10 fold cross validation with three repeats.
+* Revisit leverage JSON R packages that could help with JSON parsing.
+
+
